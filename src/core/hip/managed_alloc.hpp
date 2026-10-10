@@ -64,6 +64,20 @@ namespace gufo::hip {
   if (WeightHeapIsCarveOut())
     return hipMalloc(pointer, bytes);
   return hipMallocManaged(pointer, bytes, hipMemAttachGlobal);
+  const hipError_t status =
+      hipMallocManaged(pointer, bytes, hipMemAttachGlobal);
+  if (status != hipSuccess || pointer == nullptr || *pointer == nullptr ||
+      bytes == 0) {
+    return status;
+  }
+  const hipError_t advice =
+      hipMemAdvise(*pointer, bytes, hipMemAdviseSetCoarseGrain, 0);
+  if (advice != hipSuccess) {
+    (void)hipFree(*pointer);
+    *pointer = nullptr;
+    return advice;
+  }
+  return hipSuccess;
 }
 
 /// Typed-pointer overloads; hipMalloc itself accepts T**, so match it.
