@@ -5,33 +5,75 @@
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
+#include <cstdint>
 
 namespace gufo::hip {
 
-/// Allocate device memory, preferring the device pool (hipMalloc) and
-/// falling back to hipMallocManaged when the pool is exhausted. On the
-/// gfx1151 APU the runtime-reported device pool is capped below physical
-/// unified memory (a RAM/2 + VRAM heuristic, unaffected by amdgpu.gttsize),
-/// while managed allocations draw on the full system pool. Both pools are
-/// the same physical DRAM, so kernels see identical memory either way.
-[[nodiscard]] inline hipError_t AllocateDevice(void** pointer,
-                                               std::size_t bytes) {
+/// Keep this much free in the device heap for driver command submission.
+inline constexpr std::uint64_t kDispatchReserve = 4ull << 30;
+
+/// True when `bytes` can be taken from `free_bytes` and still leave
+/// kDispatchReserve.
+[[nodiscard]] inline bool HeapFitsAboveReserve(std::uint64_t free_bytes,
+                                               std::uint64_t bytes) {
+  return bytes <= free_bytes && free_bytes - bytes >= kDispatchReserve;
+}
+
+enum class Placement { kMalloc, kManaged };
+
+[[nodiscard]] inline Placement ChooseWeightPlacement(
+    std::uint64_t free_bytes, std::uint64_t total_weight_bytes) {
+  return HeapFitsAboveReserve(free_bytes, total_weight_bytes)
+             ? Placement::kMalloc
+             : Placement::kManaged;
+}
+
+/// Managed memory is fine-grain by default, so the GPU keeps it coherent
+/// with the CPU during a kernel. Weights and state are filled with hipMemcpy
+/// or by kernels, so coarse-grain is enough and lets the GPU cache the pages
+/// the way hipMalloc memory is cached.
+[[nodiscard]] inline hipError_t AllocateManaged(void** pointer,
+                                                std::size_t bytes) {
+  const hipError_t status =
+      hipMallocManaged(pointer, bytes, hipMemAttachGlobal);
+  if (status != hipSuccess || pointer == nullptr || *pointer == nullptr ||
+      bytes == 0) {
+    return status;
+  }
+  const hipError_t advice =
+      hipMemAdvise(*pointer, bytes, hipMemAdviseSetCoarseGrain, 0);
+  if (advice != hipSuccess) {
+    (void)hipFree(*pointer);
+    *pointer = nullptr;
+    return advice;
+  }
+  return hipSuccess;
+}
+
+[[nodiscard]] inline hipError_t AllocateDeviceOrManaged(void** pointer,
+                                                        std::size_t bytes) {
   hipError_t status = hipMalloc(pointer, bytes);
   if (status == hipErrorOutOfMemory) {
     // Clear the error as it remains sticky
     (void)hipGetLastError();
-    status = hipMallocManaged(pointer, bytes, hipMemAttachGlobal);
+    status = AllocateManaged(pointer, bytes);
   }
   return status;
 }
 
-/// Weight allocation: managed memory directly, leaving the device pool free
-/// for hot session state and scratch. Streamed read-only weights lose
-/// nothing on an APU, and the runtime's device-pool accounting stays
-/// available for state-capacity admission checks.
-[[nodiscard]] inline hipError_t AllocateWeights(void** pointer,
-                                                std::size_t bytes) {
-  return hipMallocManaged(pointer, bytes, hipMemAttachGlobal);
+/// Session state and scratch. On the gfx1151 APU the device heap is a cap
+/// below physical unified memory (ttm.pages_limit, half of RAM by default)
+/// while managed allocations draw on the whole system pool. Both are the
+/// same DRAM, so kernels see identical memory either way.
+[[nodiscard]] inline hipError_t AllocateDevice(void** pointer,
+                                               std::size_t bytes) {
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess ||
+      !HeapFitsAboveReserve(free_bytes, bytes)) {
+    return AllocateManaged(pointer, bytes);
+  }
+  return AllocateDeviceOrManaged(pointer, bytes);
 }
 
 /// Typed-pointer overloads; hipMalloc itself accepts T**, so match it.
@@ -40,11 +82,37 @@ template<typename T>
   return AllocateDevice(reinterpret_cast<void**>(pointer), bytes);
 }
 
-template<typename T>
-[[nodiscard]] inline hipError_t AllocateWeights(T** pointer,
-                                                std::size_t bytes) {
-  return AllocateWeights(reinterpret_cast<void**>(pointer), bytes);
-}
+/// Allocates the weights of one model load with a placement decided once,
+/// from the bytes about to be uploaded and the heap free at construction.
+class WeightAllocator {
+public:
+  explicit WeightAllocator(std::uint64_t total_weight_bytes)
+      : placement_(Decide(total_weight_bytes)) {}
+
+  [[nodiscard]] Placement placement() const noexcept { return placement_; }
+
+  [[nodiscard]] hipError_t Allocate(void** pointer, std::size_t bytes) const {
+    if (placement_ == Placement::kMalloc)
+      return AllocateDeviceOrManaged(pointer, bytes);
+    return AllocateManaged(pointer, bytes);
+  }
+
+  template<typename T>
+  [[nodiscard]] hipError_t Allocate(T** pointer, std::size_t bytes) const {
+    return Allocate(reinterpret_cast<void**>(pointer), bytes);
+  }
+
+private:
+  static Placement Decide(std::uint64_t total_weight_bytes) {
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess)
+      return Placement::kManaged;
+    return ChooseWeightPlacement(free_bytes, total_weight_bytes);
+  }
+
+  Placement placement_;
+};
 
 }  // namespace gufo::hip
 

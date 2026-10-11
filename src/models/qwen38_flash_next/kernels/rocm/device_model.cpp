@@ -28,6 +28,7 @@ struct Conversion {
 
 struct Uploader {
   hip::WeightUpload& stager;
+  const hip::WeightAllocator& weights;
   std::vector<Conversion>& conversions;
   std::vector<void*>& allocations;
   std::size_t& bytes;
@@ -51,7 +52,7 @@ struct Uploader {
     }
     const std::size_t size = t.SizeBytes();
     void* ptr = nullptr;
-    if (hip::AllocateWeights(&ptr, size + kTailMargin) != hipSuccess) {
+    if (weights.Allocate(&ptr, size + kTailMargin) != hipSuccess) {
       Fail("device allocation failed for " + std::string(t.name) + " (" +
            std::to_string(size) + " bytes)");
       return d;
@@ -96,8 +97,7 @@ struct Uploader {
       auto& dst = part == 0 ? embedding : hidden;
       dst = combined;
       dst.cols /= 2;
-      if (hip::AllocateWeights(&dst.data, part_bytes + kTailMargin) !=
-          hipSuccess) {
+      if (weights.Allocate(&dst.data, part_bytes + kTailMargin) != hipSuccess) {
         Fail("MTP split projection allocation failed");
         return;
       }
@@ -141,7 +141,7 @@ struct Uploader {
       size += t->SizeBytes();
     }
     void* ptr = nullptr;
-    if (hip::AllocateWeights(&ptr, size + kTailMargin) != hipSuccess) {
+    if (weights.Allocate(&ptr, size + kTailMargin) != hipSuccess) {
       Fail("stacked tensor allocation failed");
       return d;
     }
@@ -168,8 +168,8 @@ struct Uploader {
     }
     const std::size_t count = size / sizeof(float);
     void* half = nullptr;
-    if (hip::AllocateWeights(
-            &half, count * sizeof(std::uint16_t) + kTailMargin) != hipSuccess) {
+    if (weights.Allocate(&half, count * sizeof(std::uint16_t) + kTailMargin) !=
+        hipSuccess) {
       Fail("stacked tensor allocation failed");
       return d;
     }
@@ -306,9 +306,15 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   if (!stager) {
     return nullptr;
   }
+  // Total of shard files bytes about to be uploaded.
+  std::uint64_t weight_bytes = 0;
+  for (const auto& shard : shards) {
+    weight_bytes += shard.size;
+  }
+  const hip::WeightAllocator weights(weight_bytes);
   std::vector<Conversion> conversions;
-  Uploader up{*stager,           conversions,     m->allocations_, m->bytes_,
-              m->max_half_cols_, m->max_q8_cols_, error_msg};
+  Uploader up{*stager,   weights,           conversions,     m->allocations_,
+              m->bytes_, m->max_half_cols_, m->max_q8_cols_, error_msg};
   m->token_embd_ = up.Copy(w.token_embd);
   m->output_ =
       w.output.data == w.token_embd.data ? m->token_embd_ : up.Copy(w.output);
