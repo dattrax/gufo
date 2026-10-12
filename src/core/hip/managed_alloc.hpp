@@ -40,12 +40,10 @@ enum class Placement { kMalloc, kManaged };
       bytes == 0) {
     return status;
   }
-  const hipError_t advice =
-      hipMemAdvise(*pointer, bytes, hipMemAdviseSetCoarseGrain, 0);
-  if (advice != hipSuccess) {
-    (void)hipFree(*pointer);
-    *pointer = nullptr;
-    return advice;
+  if (hipMemAdvise(*pointer, bytes, hipMemAdviseSetCoarseGrain, 0) !=
+      hipSuccess) {
+    // The error is sticky; clear it so later calls do not see it.
+    (void)hipGetLastError();
   }
   return hipSuccess;
 }
