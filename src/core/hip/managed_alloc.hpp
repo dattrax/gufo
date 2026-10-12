@@ -7,26 +7,9 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/core/hip/heap_placement.hpp"
+
 namespace gufo::hip {
-
-/// Keep this much free in the device heap for driver command submission.
-inline constexpr std::uint64_t kDispatchReserve = 4ull << 30;
-
-/// True when `bytes` can be taken from `free_bytes` and still leave
-/// kDispatchReserve.
-[[nodiscard]] inline bool HeapFitsAboveReserve(std::uint64_t free_bytes,
-                                               std::uint64_t bytes) {
-  return bytes <= free_bytes && free_bytes - bytes >= kDispatchReserve;
-}
-
-enum class Placement { kMalloc, kManaged };
-
-[[nodiscard]] inline Placement ChooseWeightPlacement(
-    std::uint64_t free_bytes, std::uint64_t total_weight_bytes) {
-  return HeapFitsAboveReserve(free_bytes, total_weight_bytes)
-             ? Placement::kMalloc
-             : Placement::kManaged;
-}
 
 /// Managed memory is fine-grain by default, so the GPU keeps it coherent
 /// with the CPU during a kernel. Weights and state are filled with hipMemcpy
